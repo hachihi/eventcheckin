@@ -22,7 +22,7 @@ crons = ["* * * * *"]
 [vars]
 # Optional default event slug for camera devices that cannot send EventSlug.
 DEFAULT_EVENT_SLUG = ""
-PUBLIC_BASE_URL = ""
+PUBLIC_BASE_URL = "https://eventcheckin.catchall-3b4.workers.dev"
 # Events with allow_repeat=1: ignore re-detections of the same face within this many seconds (face terminals fire repeatedly).
 REPEAT_COOLDOWN_SEC = "30"
 
