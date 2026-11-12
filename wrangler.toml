@@ -6,7 +6,7 @@ workers_dev = true
 [[d1_databases]]
 binding = "DB"
 database_name = "hachihi-event-checkin-db"
-database_id = "REPLACE_WITH_NEW_D1_DATABASE_ID"
+database_id = "08a95139-84b4-4960-9c05-6d0178c26902"
 migrations_dir = "migrations"
 
 # Photos are stored in Google Drive via Apps Script by default (no R2 / no extra card needed).
