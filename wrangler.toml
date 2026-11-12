@@ -9,9 +9,11 @@ database_name = "hachihi-event-checkin-db"
 database_id = "REPLACE_WITH_NEW_D1_DATABASE_ID"
 migrations_dir = "migrations"
 
-[[r2_buckets]]
-binding = "PHOTOS"
-bucket_name = "hachihi-event-photos"
+# Photos are stored in Google Drive via Apps Script by default (no R2 / no extra card needed).
+# To use Cloudflare R2 instead, create the bucket and uncomment:
+# [[r2_buckets]]
+# binding = "PHOTOS"
+# bucket_name = "hachihi-event-photos"
 
 [triggers]
 # Every minute: drain Sheets outbox in batches; each Sheet source is re-imported every 5th minute (staggered).

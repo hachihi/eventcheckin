@@ -17,6 +17,7 @@ function doPost(e){
   try {
     var body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
     if (!cfg_('INTEGRATION_SECRET') || body.secret !== cfg_('INTEGRATION_SECRET')) return ContentService.createTextOutput('unauthorized');
+    if (body.action === 'photo') return savePhoto_(body);
     var rows = body.rows || [body];
     lock.waitLock(20000);
     var ss = cfg_('SPREADSHEET_ID') ? SpreadsheetApp.openById(cfg_('SPREADSHEET_ID')) : SpreadsheetApp.getActiveSpreadsheet();
@@ -38,6 +39,19 @@ function doPost(e){
   finally { try { lock.releaseLock(); } catch(x){} }
 }
 
+// Save an image to Google Drive (folder DRIVE_FOLDER_ID, or an auto-created "HACHIHI Event Photos"), shared as "anyone with the link: viewer".
+function savePhoto_(b){
+  try {
+    var mime = ['image/jpeg','image/png','image/webp'].indexOf(b.mime) >= 0 ? b.mime : 'image/jpeg';
+    var blob = Utilities.newBlob(Utilities.base64Decode(b.data), mime, 'checkin-' + Date.now() + '.jpg');
+    var folderId = cfg_('DRIVE_FOLDER_ID'), folder;
+    if (folderId) folder = DriveApp.getFolderById(folderId);
+    else { var it = DriveApp.getFoldersByName('HACHIHI Event Photos'); folder = it.hasNext() ? it.next() : DriveApp.createFolder('HACHIHI Event Photos'); }
+    var f = folder.createFile(blob); f.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return ContentService.createTextOutput('ok ' + f.getId());
+  } catch(err){ return ContentService.createTextOutput('error: ' + err.message); }
+}
+
 // Google Forms bridge (unchanged): Form submit -> Worker /api/integrations/attendee.
 function onFormSubmit(e){
   var nv = (e && e.namedValues) || {};
@@ -46,13 +60,13 @@ function onFormSubmit(e){
   var email=get('Email','Địa chỉ email');
   if(!name) throw new Error('Không tìm thấy cột Họ và tên trong Google Form');
   var photoUrl=get('Ảnh chân dung','Ảnh đại diện','Photo');
-  var fileId=driveFileId_(photoUrl), photoBase64='', photoMime='image/jpeg';
+  // Photo uploaded through the Form already lives in Drive: share it "anyone with the link" and send only its id (no re-upload).
+  var fileId=driveFileId_(photoUrl), photoMime='image/jpeg';
   if(fileId){
-    var file=DriveApp.getFileById(fileId), blob=file.getBlob();
-    photoMime=blob.getContentType() || 'image/jpeg';
-    photoBase64=Utilities.base64Encode(blob.getBytes());
+    try { var file=DriveApp.getFileById(fileId); file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); }
+    catch(err){ fileId=''; }
   }
-  var payload={event_slug:cfg_('EVENT_SLUG'),full_name:name,email:email,phone:get('Số điện thoại','Điện thoại','Phone'),company:get('Công ty','Company'),position:get('Chức danh','Position'),attendee_code:get('Mã khách','Mã đăng ký','EmployeeCode'),photo_base64:photoBase64,photo_mime:photoMime};
+  var payload={event_slug:cfg_('EVENT_SLUG'),full_name:name,email:email,phone:get('Số điện thoại','Điện thoại','Phone'),company:get('Công ty','Company'),position:get('Chức danh','Position'),attendee_code:get('Mã khách','Mã đăng ký','EmployeeCode'),photo_drive_id:fileId,photo_mime:photoMime};
   var url=cfg_('WORKER_URL')+'/api/integrations/attendee';
   var res=UrlFetchApp.fetch(url,{method:'post',contentType:'application/json',headers:{'x-integration-secret':cfg_('INTEGRATION_SECRET')},payload:JSON.stringify(payload),muteHttpExceptions:true});
   if(res.getResponseCode()<200||res.getResponseCode()>=300) throw new Error('Worker '+res.getResponseCode()+': '+res.getContentText());

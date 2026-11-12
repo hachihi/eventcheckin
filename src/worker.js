@@ -1,6 +1,6 @@
 /* HACHIHI EVENT CHECK-IN
  * Cloudflare Workers + D1 + R2. Independent from the attendance Worker.
- * Required bindings: DB (D1), PHOTOS (R2)
+ * Required bindings: DB (D1). Optional: PHOTOS (R2). Without R2, photos are stored in Google Drive through the Apps Script web app (key prefix 'drive:').
  * Required secrets: SESSION_SECRET, ADMIN_PASSWORD, MACHINE_API_KEY, GOOGLE_CLIENT_ID, APPS_SCRIPT_SECRET
  */
 const enc = new TextEncoder();
@@ -92,18 +92,32 @@ async function init(env) {
 async function eventBySlug(env,slug) { return env.DB.prepare('SELECT * FROM events WHERE slug=? AND active=1').bind(slug).first(); }
 async function getEventId(env,slug) { const e=await eventBySlug(env,slug); if(!e)throw Object.assign(new Error('Không tìm thấy sự kiện hoặc sự kiện đã khóa'),{status:404}); return e; }
 function publicEvent(e){return {id:e.id,slug:e.slug,name:e.name,event_date:e.event_date,venue:e.venue,logo_url:e.logo_url,banner_url:e.banner_url,primary_color:e.primary_color,welcome_title:e.welcome_title,welcome_message:e.welcome_message};}
+const driveOn=env=>!!(env.APPS_SCRIPT_URL&&env.APPS_SCRIPT_SECRET);
+const DRIVE_ID=/(?:\/d\/|[?&]id=)([A-Za-z0-9_-]{20,})/;
+const driveThumb=id=>'https://drive.google.com/thumbnail?id='+id+'&sz=w900';
+// Upload an image to Google Drive via the Apps Script web app (action "photo"). Returns the key 'drive:<fileId>' or null.
+async function driveUpload(env,b64,mime){
+  const res=await fetch(env.APPS_SCRIPT_URL,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({secret:env.APPS_SCRIPT_SECRET,action:'photo',mime,data:b64}),redirect:'follow',signal:AbortSignal.timeout(25000)});
+  const txt=(await res.text()).trim(),m=txt.match(/^ok ([A-Za-z0-9_-]{20,})$/);
+  if(!res.ok||!m)throw new Error('Drive upload failed: '+txt.slice(0,120));
+  return 'drive:'+m[1];
+}
+const toB64=buf=>{let s='';const u=new Uint8Array(buf);for(let i=0;i<u.length;i+=0x8000)s+=String.fromCharCode.apply(null,u.subarray(i,i+0x8000));return btoa(s)};
 async function putPhoto(env,file,eventId) {
-  if(!env.PHOTOS) throw new Error('Chưa cấu hình R2 binding PHOTOS');
   if(!file || !file.size) return null;
   if(file.size>6*1024*1024) throw new Error('Ảnh tối đa 6 MB');
   const type=file.type||'application/octet-stream';
   if(!['image/jpeg','image/png','image/webp'].includes(type)) throw new Error('Chỉ nhận ảnh JPG, PNG hoặc WEBP');
+  if(!env.PHOTOS){
+    if(!driveOn(env))return null;   // no photo storage configured: check-in still succeeds without a photo
+    try{return await driveUpload(env,toB64(await file.arrayBuffer()),type)}catch(e){return null}
+  }
   const ext=type==='image/png'?'png':type==='image/webp'?'webp':'jpg';
   const key=`events/${eventId}/attendees/${crypto.randomUUID()}.${ext}`;
   await env.PHOTOS.put(key,file.stream(),{httpMetadata:{contentType:type,cacheControl:'public, max-age=31536000, immutable'}});
   return key;
 }
-function photoUrl(key,env){return key?(String(env.PUBLIC_BASE_URL||'').replace(/\/$/,'')+'/media/'+key):'';}
+function photoUrl(key,env){if(!key)return '';if(key.startsWith('drive:'))return driveThumb(key.slice(6));return String(env.PUBLIC_BASE_URL||'').replace(/\/$/,'')+'/media/'+key;}
 async function findDuplicate(env,e,a,idem){
   if(idem){const r=await env.DB.prepare('SELECT id,checkin_time FROM checkins WHERE event_id=? AND idem_key=?').bind(e.id,idem).first();if(r)return r}
   if(!a)return null;
@@ -133,7 +147,7 @@ async function addCheckin(env,ctx,{event,attendee,name,email,company,machine,gma
   const res=await env.DB.batch(stmts),meta=res[0].meta;
   if(!meta.changes){
     const previous=await findDuplicate(env,event,attendee,idemKey);
-    if(photoKey&&env.PHOTOS&&ctx)ctx.waitUntil(env.PHOTOS.delete(photoKey).catch(()=>{}));
+    if(photoKey&&!photoKey.startsWith('drive:')&&env.PHOTOS&&ctx)ctx.waitUntil(env.PHOTOS.delete(photoKey).catch(()=>{}));
     return {duplicate:true,previous:previous||null,name,email,company};
   }
   return {success:true,id:meta.last_row_id,time,attendee_id:attendee?attendee.id:null,name,email,company,photo_url:pu,source};
@@ -300,7 +314,7 @@ async function syncSheetSource(env,source,force=false){
   const val=(r,i)=>i>=0?String(r[i]||'').trim():'';
   let skipped=0;const stmts=[];
   for(const r of rows.slice(1)){
-    const rec={name:val(r,ix.name).slice(0,120),email:emailNorm(val(r,ix.email)),code:val(r,ix.code).slice(0,100),phone:val(r,ix.phone).slice(0,40),company:val(r,ix.company).slice(0,160),position:val(r,ix.position).slice(0,120),photo:val(r,ix.photo)||null};
+    const rec={name:val(r,ix.name).slice(0,120),email:emailNorm(val(r,ix.email)),code:val(r,ix.code).slice(0,100),phone:val(r,ix.phone).slice(0,40),company:val(r,ix.company).slice(0,160),position:val(r,ix.position).slice(0,120),photo:(()=>{const p=val(r,ix.photo);if(!p)return null;const m=p.match(DRIVE_ID);return m?driveThumb(m[1]):p})()};
     // A row needs a stable key (email or guest code); otherwise every 5-minute sync would insert it again.
     if(!rec.name||(rec.email&&!validEmail(rec.email))||(!rec.email&&!rec.code)){skipped++;continue}
     stmts.push(attendeeStmt(env,e.id,rec,'google_sheet','sync'));
@@ -357,8 +371,11 @@ async function route(req,env,ctx){
       if(early)return json({success:false,duplicate:true,previous:early,name});
       if(!a){if(!e.allow_walkin)return json({error:'Khách chưa đăng ký'},403);try{const ins=await env.DB.prepare("INSERT INTO attendees(event_id,full_name,attendee_code,email,company,registration_source,created_at) VALUES(?,?,?,?,?,'machine-walkin',?)").bind(e.id,name,autoCode,email||null,'',now()).run();a={id:ins.meta.last_row_id,full_name:name,email};}catch(err){a=await env.DB.prepare('SELECT * FROM attendees WHERE event_id=? AND (attendee_code=? OR email=?)').bind(e.id,autoCode,email||'-').first();if(!a)throw err}}
       let machinePhoto=null;
+      let drivePhoto=null;if(b.Base64Image&&!env.PHOTOS&&driveOn(env)&&!(a&&a.photo_key)){const raw64=String(b.Base64Image).replace(/^data:[^,]+,/,'').replace(/\s/g,''),mime=String(b.ImageMimeType||'image/jpeg');if(raw64.length<8*1024*1024&&['image/jpeg','image/png','image/webp'].includes(mime))drivePhoto={raw64,mime}}
       if(b.Base64Image&&env.PHOTOS&&!(a&&a.photo_key)){try{const raw64=String(b.Base64Image).replace(/^data:[^,]+,/,'').replace(/\s/g,'');if(raw64.length<8*1024*1024){const bytes=Uint8Array.from(atob(raw64),ch=>ch.charCodeAt(0));if(bytes.length<=6*1024*1024){const mime=String(b.ImageMimeType||'image/jpeg');if(['image/jpeg','image/png','image/webp'].includes(mime)){const ext=mime==='image/png'?'png':mime==='image/webp'?'webp':'jpg';machinePhoto='events/'+e.id+'/checkins/'+crypto.randomUUID()+'.'+ext;await env.PHOTOS.put(machinePhoto,bytes,{httpMetadata:{contentType:mime,cacheControl:'public, max-age=31536000, immutable'}})}}}}catch(err){machinePhoto=null}}
       const r=await addCheckin(env,ctx,{event:e,attendee:a,name,email:email||a.email||'',company:a.company||'',machine:machineId,source:'machine',photoKey:machinePhoto,photoUrl:String(b.ImageUrl||'').slice(0,500),raw:{...b,Base64Image:undefined},idem});
+      // Drive upload is slow (1-3 s), so it never blocks the check-in: it runs after the response and back-fills the photo (LED shows initials until then).
+      if(r.success&&drivePhoto)ctx.waitUntil((async()=>{try{const k=await driveUpload(env,drivePhoto.raw64,drivePhoto.mime);await env.DB.batch([env.DB.prepare('UPDATE checkins SET photo_key=?,photo_url=? WHERE id=?').bind(k,photoUrl(k,env),r.id),env.DB.prepare('UPDATE attendees SET photo_key=? WHERE id=? AND photo_key IS NULL').bind(k,a.id)])}catch(e){}})());
       return json({success:!!r.success,duplicate:!!r.duplicate,...r});
     }
     if(p==='/api/public/google-config'&&method==='GET')return json({client_id:String(env.GOOGLE_CLIENT_ID||'').split(',')[0].trim()});
@@ -367,7 +384,7 @@ async function route(req,env,ctx){
       if(!env.APPS_SCRIPT_SECRET||!safeEq(req.headers.get('x-integration-secret'),env.APPS_SCRIPT_SECRET))return json({error:'Unauthorized integration'},401);
       const b=await req.json(),e=await getEventId(env,String(b.event_slug||'')),name=String(b.full_name||'').trim(),email=emailNorm(b.email);
       if(!name)return json({error:'Thiếu họ tên'},400);if(email&&!validEmail(email))return json({error:'Email không hợp lệ'},400);
-      let key=null;if(b.photo_base64){const bytes=Uint8Array.from(atob(String(b.photo_base64).replace(/^data:[^,]+,/,'').replace(/\s/g,'')),c=>c.charCodeAt(0));if(bytes.length>6*1024*1024)return json({error:'Ảnh vượt quá 6 MB'},413);const type=String(b.photo_mime||'image/jpeg');if(!['image/jpeg','image/png','image/webp'].includes(type))return json({error:'Định dạng ảnh không hỗ trợ'},400);const ext=type==='image/png'?'png':type==='image/webp'?'webp':'jpg';key='events/'+e.id+'/attendees/'+crypto.randomUUID()+'.'+ext;await env.PHOTOS.put(key,bytes,{httpMetadata:{contentType:type,cacheControl:'public, max-age=31536000, immutable'}})}
+      let key=null;if(b.photo_drive_id&&/^[A-Za-z0-9_-]{20,}$/.test(String(b.photo_drive_id)))key='drive:'+b.photo_drive_id;else if(b.photo_base64&&env.PHOTOS){const bytes=Uint8Array.from(atob(String(b.photo_base64).replace(/^data:[^,]+,/,'').replace(/\s/g,'')),c=>c.charCodeAt(0));if(bytes.length>6*1024*1024)return json({error:'Ảnh vượt quá 6 MB'},413);const type=String(b.photo_mime||'image/jpeg');if(!['image/jpeg','image/png','image/webp'].includes(type))return json({error:'Định dạng ảnh không hỗ trợ'},400);const ext=type==='image/png'?'png':type==='image/webp'?'webp':'jpg';key='events/'+e.id+'/attendees/'+crypto.randomUUID()+'.'+ext;await env.PHOTOS.put(key,bytes,{httpMetadata:{contentType:type,cacheControl:'public, max-age=31536000, immutable'}})}
       const old=email?await env.DB.prepare('SELECT id FROM attendees WHERE event_id=? AND email=?').bind(e.id,email).first():null;
       if(old){await env.DB.prepare("UPDATE attendees SET full_name=?,attendee_code=COALESCE(?,attendee_code),phone=?,company=?,position=?,photo_key=COALESCE(?,photo_key),registration_source='google_forms' WHERE id=?").bind(name,b.attendee_code||null,b.phone||'',b.company||'',b.position||'',key,old.id).run();return json({ok:true,updated:true,id:old.id,photo_url:key?photoUrl(key,env):''})}
       const ins=await env.DB.prepare("INSERT INTO attendees(event_id,full_name,attendee_code,email,phone,company,position,photo_key,registration_source,created_at) VALUES(?,?,?,?,?,?,?,?,'google_forms',?)").bind(e.id,name,b.attendee_code||null,email||null,b.phone||'',b.company||'',b.position||'',key,now()).run();return json({ok:true,id:ins.meta.last_row_id,photo_url:key?photoUrl(key,env):''});

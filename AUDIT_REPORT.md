@@ -124,3 +124,6 @@ Khuyến nghị: **sự kiện > ~5.000 khách hoặc bật Sheets → dùng Wor
 - Google Sheets cập nhật **trễ tối đa ~1 phút** (v2: gần tức thời) — đổi lấy việc không dội Apps Script lúc đông.
 - Sync Sheet bỏ qua dòng không có email lẫn mã khách; không ghi lại khi nội dung Sheet không đổi.
 - Hết sự kiện `allow_repeat`: nhiều lần phát hiện trong 30 s chỉ tính 1.
+
+## 10. Bản đóng gói cuối — lưu ảnh bằng Google Drive (không dùng R2)
+R2 là tùy chọn (khai báo binding thì dùng). Mặc định ảnh lưu Google Drive qua Apps Script (khóa ảnh dạng `drive:<id>`). [ĐÃ ĐO] cục bộ với Apps Script giả: 17/17 test chức năng đạt không có R2; ảnh từ máy và từ quầy walk-in đều ra URL Drive trên LED. [CHƯA KIỂM TRA] Drive/Apps Script thật, hạn mức Drive & Apps Script, và việc trình duyệt tải ảnh `drive.google.com/thumbnail` ổn định ở quy mô lớn.
