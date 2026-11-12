@@ -23,6 +23,8 @@ const MEM={ev:new Map(),disp:new Map()};
 async function cachedEvent(env,slug,ttl=30000){const c=MEM.ev.get(slug);if(c&&c.until>Date.now())return c.e;const e=await eventBySlug(env,slug);if(e){if(MEM.ev.size>200)MEM.ev.clear();MEM.ev.set(slug,{e,until:Date.now()+ttl})}return e}
 const cooldownMs=env=>Math.max(5,Number(env.REPEAT_COOLDOWN_SEC)||30)*1000;
 const dupResp=r=>json({error:'Bạn đã check-in lúc '+((r.previous&&r.previous.checkin_time)||'trước đó'),duplicate:true,previous:r.previous||null},409);
+// Structured logs (one JSON object per line) -> Cloudflare Workers Logs. Never log keys, passwords, emails or photo data.
+const log=(evt,data,level)=>{try{(level==='error'?console.error:level==='warn'?console.warn:console.log)(JSON.stringify({evt,t:fmtTime(Date.now()),...data}))}catch(e){}};
 async function audit(env,me,action,detail){try{await env.DB.prepare('INSERT INTO audit_logs(admin,action,detail,created_at) VALUES(?,?,?,?)').bind(me?me.username:'system',action,String(detail||'').slice(0,500),now()).run()}catch(e){}}
 
 async function hashPassword(password, saltHex) {
@@ -83,7 +85,7 @@ async function ensureSchema(env) {
 async function init(env) {
   let ready=false;
   try{await env.DB.batch([env.DB.prepare('SELECT idem_key FROM checkins LIMIT 0'),env.DB.prepare('SELECT ok FROM login_logs LIMIT 0'),env.DB.prepare('SELECT content_hash FROM sheet_sources LIMIT 0'),env.DB.prepare('SELECT 1 FROM audit_logs LIMIT 0'),env.DB.prepare('SELECT 1 FROM admins LIMIT 0')]);ready=true}catch(e){}
-  if(!ready)await ensureSchema(env);
+  if(!ready){log('schema_fallback',{},'warn');await ensureSchema(env)}
   if(env.ADMIN_USERNAME && env.ADMIN_PASSWORD) {
     const count=await env.DB.prepare('SELECT COUNT(*) n FROM admins').first();
     if(!count.n) await env.DB.prepare('INSERT INTO admins(username,password_hash,role,created_at) VALUES(?,?,?,?)').bind(env.ADMIN_USERNAME,await hashPassword(env.ADMIN_PASSWORD),'admin',now()).run();
@@ -99,7 +101,7 @@ const driveThumb=id=>'https://drive.google.com/thumbnail?id='+id+'&sz=w900';
 async function driveUpload(env,b64,mime){
   const res=await fetch(env.APPS_SCRIPT_URL,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({secret:env.APPS_SCRIPT_SECRET,action:'photo',mime,data:b64}),redirect:'follow',signal:AbortSignal.timeout(25000)});
   const txt=(await res.text()).trim(),m=txt.match(/^ok ([A-Za-z0-9_-]{20,})$/);
-  if(!res.ok||!m)throw new Error('Drive upload failed: '+txt.slice(0,120));
+  if(!res.ok||!m){log('drive_upload_error',{status:res.status,msg:txt.slice(0,120)},'error');throw new Error('Drive upload failed: '+txt.slice(0,120))}
   return 'drive:'+m[1];
 }
 const toB64=buf=>{let s='';const u=new Uint8Array(buf);for(let i=0;i<u.length;i+=0x8000)s+=String.fromCharCode.apply(null,u.subarray(i,i+0x8000));return btoa(s)};
@@ -148,8 +150,10 @@ async function addCheckin(env,ctx,{event,attendee,name,email,company,machine,gma
   if(!meta.changes){
     const previous=await findDuplicate(env,event,attendee,idemKey);
     if(photoKey&&!photoKey.startsWith('drive:')&&env.PHOTOS&&ctx)ctx.waitUntil(env.PHOTOS.delete(photoKey).catch(()=>{}));
+    log('checkin',{result:'duplicate',event_id:event.id,attendee_id:attendee?attendee.id:null,source,machine:machine||'',prev_id:previous?previous.id:null,ms:Date.now()-t0});
     return {duplicate:true,previous:previous||null,name,email,company};
   }
+  log('checkin',{result:'success',event_id:event.id,attendee_id:attendee?attendee.id:null,source,machine:machine||'',id:meta.last_row_id,ms:Date.now()-t0});
   return {success:true,id:meta.last_row_id,time,attendee_id:attendee?attendee.id:null,name,email,company,photo_url:pu,source};
 }
 // Batched delivery to Google Sheets (reporting copy). Never on the check-in path; driven by the 1-minute cron.
@@ -164,9 +168,11 @@ async function drainOutbox(env,limit=200) {
       const txt=(await res.text()).trim();if(!res.ok||!/^ok/i.test(txt))throw new Error('Apps Script '+res.status+' '+txt.slice(0,160));
       await env.DB.batch(chunk.map(r=>env.DB.prepare("UPDATE sync_outbox SET status='sent',last_error=NULL WHERE id=?").bind(r.id)));sent+=chunk.length;
     }catch(e){
+      log('outbox_error',{msg:String(e.message).slice(0,200),rows:chunk.length},'error');
       await env.DB.batch(chunk.map(r=>{const n=(r.attempts||0)+1;return env.DB.prepare('UPDATE sync_outbox SET status=?,attempts=?,next_try=?,last_error=? WHERE id=?').bind(n>=25?'dead':'pending',n,Date.now()+Math.min(6*3600e3,Math.pow(2,Math.min(n,10))*30000),String(e.message).slice(0,300),r.id)}));failed+=chunk.length;
     }
   }
+  if(rows.length)log('outbox',{sent,failed,pending_batch:rows.length},failed?'warn':'log');
   return {sent,failed};
 }
 async function googleKeys(env,force=false) {
@@ -248,14 +254,16 @@ function boot(){let p=location.pathname;if(p==='/admin'||p==='/')renderAdmin();e
 export default {
   async fetch(req,env,ctx){
     if(!env.DB)return new Response('Missing D1 binding DB',{status:500});if(!env.SESSION_SECRET)return new Response('Missing SESSION_SECRET secret',{status:500});
-    try{if(!initPromise)initPromise=init(env).catch(e=>{initPromise=null;throw e});await initPromise;return await route(req,env,ctx)}catch(e){return json({error:e.message||'Server error'},e.status||500)}
+    const t0=Date.now(),u0=new URL(req.url);let res;try{if(!initPromise)initPromise=init(env).catch(e=>{initPromise=null;throw e});await initPromise;res=await route(req,env,ctx)}catch(e){log('error',{m:req.method,p:u0.pathname,msg:String(e&&e.message||e).slice(0,300)},'error');res=json({error:e.message||'Server error'},e.status||500)}
+    // Query strings are never logged (the device key travels in them). LED polling is only logged when it fails.
+    const noisy=u0.pathname.startsWith('/api/public/display/')&&res.status<400,asset=req.method==='GET'&&!u0.pathname.startsWith('/api/');if(!noisy&&!asset)log('http',{m:req.method,p:u0.pathname,status:res.status,ms:Date.now()-t0,ip:req.headers.get('CF-Connecting-IP')||''},res.status>=500?'error':res.status>=400?'warn':'log');return res
   },
   // Cron runs every minute: (1) drain the Sheets outbox in batches, (2) re-import each active event's Sheet every 5 minutes (staggered by source id).
   async scheduled(controller,env,ctx){
     if(!initPromise)initPromise=init(env).catch(e=>{initPromise=null;throw e});await initPromise;
     ctx.waitUntil(drainOutbox(env,200).catch(()=>{}));
     const sources=(await env.DB.prepare('SELECT s.* FROM sheet_sources s JOIN events e ON e.id=s.event_id WHERE e.active=1 ORDER BY s.id').all()).results,minute=Math.floor(Date.now()/60000);
-    for(const src of sources){if(minute%5!==src.id%5)continue;ctx.waitUntil(syncSheetSource(env,src).catch(async e=>{await env.DB.prepare('UPDATE sheet_sources SET last_error=? WHERE id=?').bind(String(e.message).slice(0,300),src.id).run()}))}
+    for(const src of sources){if(minute%5!==src.id%5)continue;ctx.waitUntil(syncSheetSource(env,src).catch(async e=>{log('sheet_sync_error',{source_id:src.id,event_id:src.event_id,msg:String(e.message).slice(0,200)},'error');await env.DB.prepare('UPDATE sheet_sources SET last_error=? WHERE id=?').bind(String(e.message).slice(0,300),src.id).run()}))}
   }
 };
 
@@ -324,6 +332,7 @@ async function syncSheetSource(env,source,force=false){
   const after=(await env.DB.prepare('SELECT COUNT(*) n FROM attendees WHERE event_id=?').bind(e.id).first()).n;
   const inserted=Math.max(0,after-before),updated=Math.max(0,changes-inserted);
   await env.DB.prepare('UPDATE sheet_sources SET last_sync_at=?,last_error=NULL,content_hash=? WHERE id=?').bind(now(),hash,source.id).run();
+  log('sheet_sync',{event_id:e.id,inserted,updated,skipped,total:rows.length-1});
   return {inserted,updated,skipped,total:rows.length-1};
 }
 
@@ -333,7 +342,7 @@ async function route(req,env,ctx){
   if(p.startsWith('/media/')){const key=decodeURIComponent(p.slice(7));if(!env.PHOTOS)return new Response('R2 unavailable',{status:503});const obj=await env.PHOTOS.get(key);if(!obj)return new Response('Not found',{status:404});return new Response(obj.body,{headers:{'content-type':obj.httpMetadata?.contentType||'application/octet-stream','cache-control':'public, max-age=31536000, immutable','etag':obj.httpEtag}})}
   // NOTE: the face-terminal webhook (POST / and POST /checkin, as documented in the README) must be routed here too; in v2 it sat inside the /api/ block only, so those URLs returned the HTML page with HTTP 200 and nothing was recorded.
   if(p.startsWith('/api/')||((p==='/'||p==='/checkin')&&method==='POST')){
-    if(p==='/api/admin/login'&&method==='POST'){const b=await req.json().catch(()=>({}));const ip=req.headers.get('CF-Connecting-IP')||'',uname=String(b.username||'').slice(0,80);const since=fmtTime(Date.now()-15*60000);const [fu,fi]=await env.DB.batch([env.DB.prepare('SELECT COUNT(*) n FROM login_logs WHERE ok=0 AND created_at>? AND username=?').bind(since,uname),env.DB.prepare('SELECT COUNT(*) n FROM login_logs WHERE ok=0 AND created_at>? AND ip=?').bind(since,ip)]);/* per-account limit is strict; per-IP limit is loose because a whole venue shares one NAT address */if(fu.results[0].n>=8||fi.results[0].n>=40)return json({error:'Đăng nhập sai quá nhiều lần. Vui lòng thử lại sau 15 phút.'},429);const a=await env.DB.prepare('SELECT * FROM admins WHERE username=?').bind(uname).first();if(!a||!(await verifyPassword(String(b.password||''),a.password_hash))){await env.DB.prepare('INSERT INTO login_logs(username,ip,created_at,ok) VALUES(?,?,?,0)').bind(uname,ip,now()).run();return json({error:'Sai tài khoản hoặc mật khẩu'},401)}await env.DB.prepare('INSERT INTO login_logs(username,ip,created_at,ok) VALUES(?,?,?,1)').bind(a.username,ip,now()).run();return json({ok:true},200,{'set-cookie':await sessionCookie(env,a.id)});}
+    if(p==='/api/admin/login'&&method==='POST'){const b=await req.json().catch(()=>({}));const ip=req.headers.get('CF-Connecting-IP')||'',uname=String(b.username||'').slice(0,80);const since=fmtTime(Date.now()-15*60000);const [fu,fi]=await env.DB.batch([env.DB.prepare('SELECT COUNT(*) n FROM login_logs WHERE ok=0 AND created_at>? AND username=?').bind(since,uname),env.DB.prepare('SELECT COUNT(*) n FROM login_logs WHERE ok=0 AND created_at>? AND ip=?').bind(since,ip)]);/* per-account limit is strict; per-IP limit is loose because a whole venue shares one NAT address */if(fu.results[0].n>=8||fi.results[0].n>=40){log('login_locked',{user:uname,ip},'warn');return json({error:'Đăng nhập sai quá nhiều lần. Vui lòng thử lại sau 15 phút.'},429)}const a=await env.DB.prepare('SELECT * FROM admins WHERE username=?').bind(uname).first();if(!a||!(await verifyPassword(String(b.password||''),a.password_hash))){await env.DB.prepare('INSERT INTO login_logs(username,ip,created_at,ok) VALUES(?,?,?,0)').bind(uname,ip,now()).run();log('login_fail',{user:uname,ip},'warn');return json({error:'Sai tài khoản hoặc mật khẩu'},401)}await env.DB.prepare('INSERT INTO login_logs(username,ip,created_at,ok) VALUES(?,?,?,1)').bind(a.username,ip,now()).run();log('login_ok',{user:a.username,ip});return json({ok:true},200,{'set-cookie':await sessionCookie(env,a.id)});}
     if(p==='/api/admin/logout'&&method==='POST')return json({ok:true},200,{'set-cookie':'hch_event=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0'});
     if(p==='/api/public/event/'+p.split('/').pop()&&method==='GET'){const e=await cachedEvent(env,p.split('/').pop(),10000);return e?json(publicEvent(e)):json({error:'Không tìm thấy sự kiện'},404)}
     let m=p.match(/^\/api\/public\/display\/([a-z0-9-]+)$/);if(m&&method==='GET'){
@@ -353,7 +362,7 @@ async function route(req,env,ctx){
     // Camera/attendance terminal webhook. The old Worker is untouched; the new one accepts its familiar JSON payload.
     if((p==='/'||p==='/checkin'||p==='/api/device/checkin')&&method==='POST'){
       const supplied=req.headers.get('x-device-key')||u.searchParams.get('key');
-      if(!env.MACHINE_API_KEY||!safeEq(supplied,env.MACHINE_API_KEY))return json({error:'Unauthorized device'},401);
+      if(!env.MACHINE_API_KEY||!safeEq(supplied,env.MACHINE_API_KEY)){log('device_unauthorized',{ip:req.headers.get('CF-Connecting-IP')||'',key_set:!!env.MACHINE_API_KEY},'warn');return json({error:'Unauthorized device'},401)}
       const b=await req.json().catch(()=>null);if(!b||typeof b!=='object')return json({error:'Invalid JSON'},400);
       const slug=String(b.EventSlug||u.searchParams.get('event')||env.DEFAULT_EVENT_SLUG||'').trim();if(!slug)return json({error:'Thiếu EventSlug hoặc DEFAULT_EVENT_SLUG'},400);
       const e=await getEventId(env,slug);
@@ -368,8 +377,8 @@ async function route(req,env,ctx){
       if(!a&&!code)a=await env.DB.prepare('SELECT * FROM attendees WHERE event_id=? AND attendee_code=?').bind(e.id,autoCode).first();
       // Duplicate / retry short-circuit BEFORE any photo work or writes. Devices get HTTP 200 so they stop retrying.
       const early=await findDuplicate(env,e,a,idem);
-      if(early)return json({success:false,duplicate:true,previous:early,name});
-      if(!a){if(!e.allow_walkin)return json({error:'Khách chưa đăng ký'},403);try{const ins=await env.DB.prepare("INSERT INTO attendees(event_id,full_name,attendee_code,email,company,registration_source,created_at) VALUES(?,?,?,?,?,'machine-walkin',?)").bind(e.id,name,autoCode,email||null,'',now()).run();a={id:ins.meta.last_row_id,full_name:name,email};}catch(err){a=await env.DB.prepare('SELECT * FROM attendees WHERE event_id=? AND (attendee_code=? OR email=?)').bind(e.id,autoCode,email||'-').first();if(!a)throw err}}
+      if(early){log('checkin',{result:'duplicate_early',event_id:e.id,attendee_id:a?a.id:null,source:'machine',machine:machineId,prev_id:early.id});return json({success:false,duplicate:true,previous:early,name})}
+      if(!a){if(!e.allow_walkin){log('checkin',{result:'rejected_unregistered',event_id:e.id,source:'machine',machine:machineId,code:code},'warn');return json({error:'Khách chưa đăng ký'},403)}try{const ins=await env.DB.prepare("INSERT INTO attendees(event_id,full_name,attendee_code,email,company,registration_source,created_at) VALUES(?,?,?,?,?,'machine-walkin',?)").bind(e.id,name,autoCode,email||null,'',now()).run();a={id:ins.meta.last_row_id,full_name:name,email};}catch(err){a=await env.DB.prepare('SELECT * FROM attendees WHERE event_id=? AND (attendee_code=? OR email=?)').bind(e.id,autoCode,email||'-').first();if(!a)throw err}}
       let machinePhoto=null;
       let drivePhoto=null;if(b.Base64Image&&!env.PHOTOS&&driveOn(env)&&!(a&&a.photo_key)){const raw64=String(b.Base64Image).replace(/^data:[^,]+,/,'').replace(/\s/g,''),mime=String(b.ImageMimeType||'image/jpeg');if(raw64.length<8*1024*1024&&['image/jpeg','image/png','image/webp'].includes(mime))drivePhoto={raw64,mime}}
       if(b.Base64Image&&env.PHOTOS&&!(a&&a.photo_key)){try{const raw64=String(b.Base64Image).replace(/^data:[^,]+,/,'').replace(/\s/g,'');if(raw64.length<8*1024*1024){const bytes=Uint8Array.from(atob(raw64),ch=>ch.charCodeAt(0));if(bytes.length<=6*1024*1024){const mime=String(b.ImageMimeType||'image/jpeg');if(['image/jpeg','image/png','image/webp'].includes(mime)){const ext=mime==='image/png'?'png':mime==='image/webp'?'webp':'jpg';machinePhoto='events/'+e.id+'/checkins/'+crypto.randomUUID()+'.'+ext;await env.PHOTOS.put(machinePhoto,bytes,{httpMetadata:{contentType:mime,cacheControl:'public, max-age=31536000, immutable'}})}}}}catch(err){machinePhoto=null}}
@@ -428,6 +437,7 @@ async function route(req,env,ctx){
     if(p==='/api/admin/attendees/export'&&method==='GET'){const id=Number(u.searchParams.get('event_id'));const r=await env.DB.prepare('SELECT full_name,attendee_code,email,phone,company,position,created_at FROM attendees WHERE event_id=? ORDER BY full_name').bind(id).all();return csv(['Họ tên','Mã khách','Email','Điện thoại','Công ty','Chức danh','Ngày tạo'],r.results.map(x=>[x.full_name,x.attendee_code,x.email,x.phone,x.company,x.position,x.created_at]),'attendees.csv')}
     if(p==='/api/admin/checkins'&&method==='GET'){const id=Number(u.searchParams.get('event_id'));const r=await env.DB.prepare('SELECT id,full_name,email,company,checkin_time,machine,gmail,source,result FROM checkins WHERE event_id=? ORDER BY id DESC LIMIT 2000').bind(id).all();return json(r.results)}
     if(p==='/api/admin/checkins/export'&&method==='GET'){const id=Number(u.searchParams.get('event_id'));const r=await env.DB.prepare('SELECT full_name,email,company,checkin_time,machine,gmail,source,result FROM checkins WHERE event_id=? ORDER BY id DESC').bind(id).all();return csv(['Họ tên','Email','Công ty','Thời gian','Máy','Gmail','Nguồn','Kết quả'],r.results.map(x=>[x.full_name,x.email,x.company,x.checkin_time,x.machine,x.gmail,x.source,x.result]),'checkins.csv')}
+    if(p==='/api/admin/audit'&&method==='GET'){const lim=Math.min(500,Math.max(1,Number(u.searchParams.get('limit'))||100));return json((await env.DB.prepare('SELECT id,admin,action,detail,created_at FROM audit_logs ORDER BY id DESC LIMIT ?').bind(lim).all()).results)}
     if(p==='/api/admin/sync/run'&&method==='POST'){return json({ok:true,...await drainOutbox(env,200)})}
     if(p==='/api/admin/sync/status'&&method==='GET'){const r=await env.DB.prepare("SELECT status,COUNT(*) count FROM sync_outbox GROUP BY status").all();return json(r.results)}
     return json({error:'API not found'},404);

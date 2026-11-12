@@ -1,4 +1,4 @@
-name = "hachihi-event-checkin"
+name = "eventcheckin"
 main = "src/worker.js"
 compatibility_date = "2026-11-11"
 workers_dev = true
@@ -6,7 +6,7 @@ workers_dev = true
 [[d1_databases]]
 binding = "DB"
 database_name = "hachihi-event-checkin-db"
-database_id = "08a95139-84b4-4960-9c05-6d0178c26902"
+database_id = "REPLACE_WITH_NEW_D1_DATABASE_ID"
 migrations_dir = "migrations"
 
 # Photos are stored in Google Drive via Apps Script by default (no R2 / no extra card needed).
@@ -22,7 +22,7 @@ crons = ["* * * * *"]
 [vars]
 # Optional default event slug for camera devices that cannot send EventSlug.
 DEFAULT_EVENT_SLUG = ""
-PUBLIC_BASE_URL = "https://eventcheckin.catchall-3b4.workers.dev"
+PUBLIC_BASE_URL = ""
 # Events with allow_repeat=1: ignore re-detections of the same face within this many seconds (face terminals fire repeatedly).
 REPEAT_COOLDOWN_SEC = "30"
 
