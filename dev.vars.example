@@ -1,0 +1,9 @@
+SESSION_SECRET=replace-with-a-long-random-secret
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=replace-with-a-strong-unique-password
+MACHINE_API_KEY=replace-with-a-different-long-random-secret
+APPS_SCRIPT_SECRET=replace-with-another-long-random-secret
+GOOGLE_CLIENT_ID=your-google-oauth-web-client-id.apps.googleusercontent.com
+APPS_SCRIPT_URL=https://script.google.com/macros/s/DEPLOYMENT_ID/exec
+# Optional
+DEFAULT_EVENT_SLUG=demo-event

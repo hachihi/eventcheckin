@@ -1,0 +1,28 @@
+name = "hachihi-event-checkin"
+main = "src/worker.js"
+compatibility_date = "2026-11-11"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hachihi-event-checkin-db"
+database_id = "REPLACE_WITH_NEW_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "hachihi-event-photos"
+
+[triggers]
+# Every minute: drain Sheets outbox in batches; each Sheet source is re-imported every 5th minute (staggered).
+crons = ["* * * * *"]
+
+[vars]
+# Optional default event slug for camera devices that cannot send EventSlug.
+DEFAULT_EVENT_SLUG = ""
+PUBLIC_BASE_URL = ""
+# Events with allow_repeat=1: ignore re-detections of the same face within this many seconds (face terminals fire repeatedly).
+REPEAT_COOLDOWN_SEC = "30"
+
+[observability]
+enabled = true

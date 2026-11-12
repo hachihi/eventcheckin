@@ -1,0 +1,16 @@
+{
+  "name": "hachihi-event-checkin",
+  "version": "3.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply hachihi-event-checkin-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply hachihi-event-checkin-db --remote",
+    "test:functional": "node bench/functional-test.mjs",
+    "bench:explain": "python3 bench/explain-plan.py 100000 1000000"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
