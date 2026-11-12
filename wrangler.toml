@@ -1,5 +1,7 @@
 name = "eventcheckin"
 main = "src/worker.js"
+# Keep variables/secrets set in the dashboard when deploying from Git.
+keep_vars = true
 compatibility_date = "2026-11-11"
 workers_dev = true
 
