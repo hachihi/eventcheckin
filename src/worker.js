@@ -27,10 +27,11 @@ const dupResp=r=>json({error:'Bạn đã check-in lúc '+((r.previous&&r.previou
 const log=(evt,data,level)=>{try{(level==='error'?console.error:level==='warn'?console.warn:console.log)(JSON.stringify({evt,t:fmtTime(Date.now()),...data}))}catch(e){}};
 async function audit(env,me,action,detail){try{await env.DB.prepare('INSERT INTO audit_logs(admin,action,detail,created_at) VALUES(?,?,?,?)').bind(me?me.username:'system',action,String(detail||'').slice(0,500),now()).run()}catch(e){}}
 
+// Cloudflare Workers rejects PBKDF2 above 100,000 iterations (hard limit), so this must stay <= 100000.
 async function hashPassword(password, saltHex) {
   const salt = saltHex ? Uint8Array.from(saltHex.match(/../g).map(x=>parseInt(x,16))) : rand(16);
   const key = await crypto.subtle.importKey('raw',enc.encode(password),'PBKDF2',false,['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:150000,hash:'SHA-256'},key,256);
+  const bits = await crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:100000,hash:'SHA-256'},key,256);
   return hex(salt)+':'+hex(bits);
 }
 async function verifyPassword(password, stored) {
@@ -253,7 +254,7 @@ function boot(){let p=location.pathname;if(p==='/admin'||p==='/')renderAdmin();e
 
 export default {
   async fetch(req,env,ctx){
-    if(!env.DB)return new Response('Missing D1 binding DB',{status:500});if(!env.SESSION_SECRET)return new Response('Missing SESSION_SECRET secret',{status:500});
+    if(!env.DB)return new Response('Missing D1 binding DB',{status:500});if(!env.SESSION_SECRET){const have=Object.keys(env).filter(k=>k!=='DB').sort().join(', ')||'(không có biến nào)';return new Response('Missing SESSION_SECRET secret.\nWorker này đang nhận các biến: '+have+'\nKiểm tra: (1) đúng Worker, (2) tên viết đúng chữ hoa, không khoảng trắng, (3) loại Secret, (4) đã Deploy lại.',{status:500,headers:{'content-type':'text/plain; charset=utf-8'}})}
     const t0=Date.now(),u0=new URL(req.url);let res;try{if(!initPromise)initPromise=init(env).catch(e=>{initPromise=null;throw e});await initPromise;res=await route(req,env,ctx)}catch(e){log('error',{m:req.method,p:u0.pathname,msg:String(e&&e.message||e).slice(0,300)},'error');res=json({error:e.message||'Server error'},e.status||500)}
     // Query strings are never logged (the device key travels in them). LED polling is only logged when it fails.
     const noisy=u0.pathname.startsWith('/api/public/display/')&&res.status<400,asset=req.method==='GET'&&!u0.pathname.startsWith('/api/');if(!noisy&&!asset)log('http',{m:req.method,p:u0.pathname,status:res.status,ms:Date.now()-t0,ip:req.headers.get('CF-Connecting-IP')||''},res.status>=500?'error':res.status>=400?'warn':'log');return res
